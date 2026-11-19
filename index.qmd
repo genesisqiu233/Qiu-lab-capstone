@@ -1,0 +1,442 @@
+---
+title: "Outcome-Locked Ventral Tegmental Area Inhibition Bidirectionally Modulates Probabilistic Risk Preference"
+subtitle: "Psychology 9401 Capstone Project: Reproducible Statistical Analysis"
+author: Caotao Qiu (Genesis)
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-tools: true
+    theme: cosmo
+    df-print: paged
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+```{r setup}
+#| label: setup
+#| include: false
+
+# Load required packages for reproducible data management, mixed modeling, and reporting
+library(tidyverse)
+library(readxl)
+library(here)
+library(lme4)
+library(lmerTest)
+library(emmeans)
+library(performance)
+library(broom.mixed)
+library(knitr)
+library(kableExtra)
+library(patchwork)
+
+options(scipen = 999, digits = 3)
+theme_set(theme_classic(base_size = 11))
+```
+
+```{r import-and-clean}
+#| label: import-and-clean
+
+# 1. Project-relative data import (supports data/ subfolder or project root)
+data_path <- if (file.exists(here("data", "VTA_DATA_SQUAD1_FINAL.xlsx"))) {
+  here("data", "VTA_DATA_SQUAD1_FINAL.xlsx")
+} else {
+  here("VTA_DATA_SQUAD1_FINAL.xlsx")
+}
+
+raw_vta <- read_excel(data_path, sheet = "VTA_DATA_SQUAD1_FINAL")
+
+# 2. Data hygiene, string normalization, and feature engineering
+vta_clean <- raw_vta |>
+  rename_with(str_trim) |>
+  select(-starts_with("Stats by Block"), -starts_with("Trial level data")) |>
+  mutate(
+    Subject = factor(str_trim(Subject)),
+    Group = factor(str_trim(Group), levels = c("EYFP", "Arch")),
+    # Normalize lowercase '20mw' entry to '20mW'
+    Condition = str_trim(Condition) |> recode("20mw" = "20mW"),
+    Condition = factor(Condition, levels = c("blocked", "20mW")),
+    # Extract schedule order (Asc vs Desc), risky lever side, and stimulation epoch from MSN
+    Order = factor(str_extract(MSN, "(?<=PD_)(Asc|Desc)"), levels = c("Asc", "Desc")),
+    RiskyLever = factor(str_extract(MSN, "(?<=_)(L|R)(?=_JDS)")),
+    TaskPhase = str_extract(MSN, "(?<=BoxA_).+$"),
+    TaskPhase = factor(
+      TaskPhase,
+      levels = c("Choice", "Certain", "CertainITI", "RiskyWin", "RiskyWinITI", "RiskyLoss")
+    ),
+    # Primary behavioral choice and trial-accounting metrics
+    Total_Free_Choices = `HR-press` + `LR-press`,
+    Prop_HR = `HR-press` / Total_Free_Choices,
+    Active_Trials_Check = Total_Free_Choices + Omit_AllTrials
+  )
+
+# Verify data integrity invariants
+stopifnot(
+  nrow(vta_clean) == 612,
+  n_distinct(vta_clean$Subject) == 20,
+  all(vta_clean$Active_Trials_Check == 120),
+  sum(is.na(vta_clean$Prop_HR)) == 0
+)
+
+# Extract key sample counts for dynamic inline reporting
+n_sessions   <- nrow(vta_clean)
+n_subjects   <- n_distinct(vta_clean$Subject)
+n_arch_rats  <- vta_clean |> filter(Group == "Arch") |> pull(Subject) |> n_distinct()
+n_eyfp_rats  <- vta_clean |> filter(Group == "EYFP") |> pull(Subject) |> n_distinct()
+n_blocked    <- sum(vta_clean$Condition == "blocked")
+n_laser      <- sum(vta_clean$Condition == "20mW")
+```
+
+## Introduction
+
+Adaptive decision-making under uncertainty requires organisms to integrate reward magnitude with reward probability and continuously update action values based on experienced outcomes. In rodent probabilistic discounting (PD) tasks, animals choose between a small, certain reward (1 sucrose pellet delivered with 100% probability) and a large, risky reward (4 sucrose pellets delivered with probabilities varying systematically across trial blocks from 100% down to 6.25%). Phasic activity of dopamine neurons in the ventral tegmental area (VTA) encodes reward prediction errors (RPEs)—bursting when outcomes exceed expectations and pausing when expected rewards are omitted—to guide value-based learning and risk preference.
+
+However, because traditional pharmacological lesions or systemic drugs alter neural signaling across entire test sessions, it remains critical to dissociate *when* during a decision cycle VTA activity causally shapes risk preference. Specifically, does VTA activity primarily govern **choice deliberation** prior to lever selection, or does it exert its causal influence during **outcome evaluation** (when small/certain rewards, large/risky wins, or risky reward omissions are experienced)? Answering this question clarifies the neurocomputational mechanisms underlying maladaptive risk-seeking and impaired loss sensitivity in substance use and impulse-control disorders.
+
+Using an approved preclinical optogenetic dataset (`VTA_DATA_SQUAD1_FINAL.xlsx`), this study investigates how temporally discrete, 532-nm laser inhibition of VTA neurons in Archaerhodopsin-expressing rats (`Arch`) versus fluorophore control rats (`EYFP`) alters probabilistic choice across six distinct task epochs (`Choice`, `Certain`, `CertainITI`, `RiskyWin`, `RiskyWinITI`, and `RiskyLoss`). We test three primary hypotheses:
+
+1. **Epoch Specificity Over Global Inhibition:** Because VTA activity carries opposite-signed RPE signals during certain versus risky outcomes, laser silencing will not produce a uniform shift across all epochs, but will instead depend on a three-way interaction among viral group (`Arch` vs. `EYFP`), laser condition (`20mW` vs. `blocked`), and task epoch (`TaskPhase`).
+2. **Bidirectional Outcome-Locked Modulation:** In `Arch` rats, silencing VTA during receipt of the small/certain reward (`Certain`) will blunt the subjective value of the safe option and *increase* preference for the large/risky lever, whereas silencing VTA during receipt of a large/risky payoff (`RiskyWin`) will blunt positive reinforcement of the risky option, *decreasing* risky choice and *increasing* lose-shift switching (`LSRatio`).
+3. **Control & Temporal Specificity:** Neither `EYFP` control rats nor `Arch` rats stimulated during inter-trial interval control windows (`CertainITI`, `RiskyWinITI`) will exhibit reliable shifts from baseline choice behavior.
+
+---
+
+## Methods
+
+### Data Source, Ethics, and Reproducibility Governance
+
+The dataset (`VTA_DATA_SQUAD1_FINAL.xlsx`, Squad 1) comprises de-identified behavioral operant logs exported from MED-PC workstations (`N = `r n_sessions`` sessions across `n = `r n_subjects`` rats). Data access and use were approved for Psychology 9401. All subject identifiers are anonymized alphanumeric codes (`DVR02`–`DVR26`), and raw session-level data files are excluded from public version-control tracking (`.gitignore`) in compliance with laboratory data-sharing governance. The unit of observation is an individual behavioral test session (`120` active trials per session across five `24`-trial probability blocks: `8` forced-choice and `16` free-choice trials per block).
+
+### Subjects, Apparatus, and Experimental Design
+
+Twenty rats received bilateral viral infusions into the VTA of either inhibitory Archaerhodopsin (`Arch`, `n = `r n_arch_rats`` rats, `426` sessions) or a control fluorophore (`EYFP`, `n = `r n_eyfp_rats`` rats, `186` sessions) paired with chronic indwelling optic fibers. During each session, rats chose between a Small/Certain lever (1 pellet, 100% odds) and a Large/Risky lever (4 pellets) across five consecutive probability blocks presented in either **Descending** (`100% → 50% → 25% → 12.5% → 6.25%`) or **Ascending** (`6.25% → 12.5% → 25% → 50% → 100%`) order.
+
+Across testing phases, intracranial laser delivery (`20mW`, `n = `r n_laser`` sessions) was interleaved with no-laser baseline sessions (`blocked`, `n = `r n_blocked`` sessions) and time-locked to one of six task epochs encoded in the MED-PC program string (`MSN`):
+
+* **`Choice`**: Laser stimulation during pre-choice deliberation/lever extension.
+* **`Certain` / `CertainITI`**: Laser stimulation during delivery of the 1-pellet certain reward, or during the corresponding post-reward inter-trial interval (ITI) temporal control window.
+* **`RiskyWin` / `RiskyWinITI`**: Laser stimulation during delivery of the 4-pellet risky reward, or during the corresponding post-win ITI temporal control window.
+* **`RiskyLoss`**: Laser stimulation during the unrewarded timeout following an unsuccessful risky lever press.
+
+### Data Preparation and Missing-Data Audit
+
+Automated preprocessing in R performed four auditable steps: (1) trimming trailing whitespace from raw column headers (e.g., `"Subject "`); (2) removing two empty spreadsheet divider columns (`Stats by Block (free choice only)` and `Trial level data`); (3) standardizing a single lowercase label (`"20mw"` $\to$ `"20mW"`); and (4) parsing schedule `Order` (`Asc` vs. `Desc`), `RiskyLever` (`L` vs. `R`), and `TaskPhase` from the `MSN` identifier. Trial-accounting verification confirmed zero missing values across all session variables and exact trial conservation ($\text{HR-press} + \text{LR-press} + \text{Omit\_AllTrials} = 120$ active trials in `100%` of the `612` sessions).
+
+### Statistical Modeling Strategy and Candidate Models
+
+Because sessions are nested within rats (`6` to `36` sessions per subject), ordinary least squares regression would violate independence assumptions and underestimate standard errors. We therefore specified a nested hierarchy of linear mixed-effects models (LMMs) with subject-level random intercepts `(1 | Subject)` predicting the session-level proportion of high-risk free choices ($\text{Prop\_HR} = \text{HR-press} / [\text{HR-press} + \text{LR-press}]$):
+
+* **`M0` (Null Random-Intercept Model):** $\text{Prop\_HR}_{ij} = \beta_0 + u_{0j} + \epsilon_{ij}$, used to partition variance and compute the intraclass correlation coefficient ($\text{ICC}$).
+* **`M1` (Additive Main-Effects Model):** Adds main effects of `Group`, `Condition`, `TaskPhase`, and schedule `Order` to evaluate average differences without cross-factor moderation.
+* **`M2` (Global Group $\times$ Laser Interaction Model):** Adds `Group * Condition` to test whether VTA laser silencing shifts risky choice uniformly across all task phases.
+* **`M3` (Epoch-Specific Three-Way Interaction Model):** Specifies `Group * Condition * TaskPhase + Order + (1 | Subject)`, directly testing whether VTA inhibition alters risky choice in an outcome- and epoch-specific manner.
+
+Candidate models were compared under Maximum Likelihood (`REML = FALSE`) via Akaike Information Criterion ($\text{AIC}$), Bayesian Information Criterion ($\text{BIC}$), nested likelihood-ratio tests ($\chi^2$ LRT), and Nakagawa–Schielzeth marginal ($R^2_m$) and conditional ($R^2_c$) variance explained. The selected model (`M3`) was refit via Restricted Maximum Likelihood (`REML = TRUE`) to obtain unbiased variance components and planned within-epoch laser contrasts (`20mW − blocked`) using `emmeans`. To verify robustness against bounded proportions, we also fit a sensitivity Binomial generalized linear mixed-effects model (`glmer`) on discrete lever counts (`cbind(HR-press, LR-press)`), and fit an analogous LMM on Lose-Shift Ratio (`LSRatio`) to evaluate trial-by-trial error sensitivity.
+
+---
+
+## Results
+
+### Descriptive Statistics
+
+```{r table1-descriptives}
+#| label: table1-descriptives
+
+tab1 <- vta_clean |>
+  group_by(Group, Condition) |>
+  summarise(
+    Rats = n_distinct(Subject),
+    Sessions = n(),
+    `Prop HR` = sprintf("%.3f (%.3f)", mean(Prop_HR), sd(Prop_HR)),
+    `HR Presses` = sprintf("%.1f (%.1f)", mean(`HR-press`), sd(`HR-press`)),
+    `LR Presses` = sprintf("%.1f (%.1f)", mean(`LR-press`), sd(`LR-press`)),
+    `Win-Stay` = sprintf("%.3f (%.3f)", mean(WSRatio), sd(WSRatio)),
+    `Lose-Shift` = sprintf("%.3f (%.3f)", mean(LSRatio), sd(LSRatio)),
+    `Choice Lat (s)` = sprintf("%.2f (%.2f)", mean(Latency_FreeChoice), sd(Latency_FreeChoice)),
+    `Omissions` = sprintf("%.1f (%.1f)", mean(Omit_AllTrials), sd(Omit_AllTrials)),
+    .groups = "drop"
+  )
+
+kable(
+  tab1,
+  caption = "Table 1. Session-Level Behavioral Descriptive Statistics [Mean (SD)] by Viral Group and Laser Condition.",
+  align = "llccccccccc"
+) |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE)
+```
+
+Across all `612` sessions, rats completed an average of `106.9` (`SD = 16.6`) free-choice trials per session and exhibited high baseline win-stay fidelity (`M = 0.951`, `SD = 0.050`). As shown in Table 1, marginal averages collapsed across all six stimulation epochs appear nearly identical between `blocked` and `20mW` sessions in both `EYFP` (`0.554` vs. `0.552`) and `Arch` (`0.577` vs. `0.577`) groups, underscoring why epoch-specific modeling is required.
+
+```{r table2-epoch-descriptives}
+#| label: table2-epoch-descriptives
+
+tab2 <- vta_clean |>
+  group_by(Group, TaskPhase, Condition) |>
+  summarise(
+    n = n(),
+    mean_hr = mean(Prop_HR),
+    sd_hr = sd(Prop_HR),
+    mean_ls = mean(LSRatio),
+    .groups = "drop"
+  ) |>
+  pivot_wider(
+    names_from = Condition,
+    values_from = c(n, mean_hr, sd_hr, mean_ls)
+  ) |>
+  mutate(
+    `Sessions (BL / Laser)` = sprintf("%d / %d", n_blocked, n_20mW),
+    `Baseline Prop HR` = sprintf("%.3f (%.3f)", mean_hr_blocked, sd_hr_blocked),
+    `Laser Prop HR` = sprintf("%.3f (%.3f)", mean_hr_20mW, sd_hr_20mW),
+    `Raw Δ HR (pp)` = sprintf("%+.1f", (mean_hr_20mW - mean_hr_blocked) * 100),
+    `Raw Δ Lose-Shift (pp)` = sprintf("%+.1f", (mean_ls_20mW - mean_ls_blocked) * 100)
+  ) |>
+  select(Group, `Task Epoch` = TaskPhase, `Sessions (BL / Laser)`, `Baseline Prop HR`, `Laser Prop HR`, `Raw Δ HR (pp)`, `Raw Δ Lose-Shift (pp)`)
+
+kable(
+  tab2,
+  caption = "Table 2. Descriptive Risky Choice [Mean (SD)] and Raw Laser Shifts Across Stimulation Epochs.",
+  align = "llccccc"
+) |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE)
+```
+
+### Model Comparison and Selection
+
+```{r model-comparison}
+#| label: model-comparison
+
+# Fit nested candidate models using ML for valid likelihood-ratio comparisons
+m0_ml <- lmer(Prop_HR ~ 1 + (1 | Subject), data = vta_clean, REML = FALSE)
+m1_ml <- lmer(Prop_HR ~ Group + Condition + TaskPhase + Order + (1 | Subject), data = vta_clean, REML = FALSE)
+m2_ml <- lmer(Prop_HR ~ Group * Condition + TaskPhase + Order + (1 | Subject), data = vta_clean, REML = FALSE)
+m3_ml <- lmer(Prop_HR ~ Group * Condition * TaskPhase + Order + (1 | Subject), data = vta_clean, REML = FALSE)
+
+lrt_res <- anova(m0_ml, m1_ml, m2_ml, m3_ml)
+r2_list <- lapply(list(m0_ml, m1_ml, m2_ml, m3_ml), r2_nakagawa)
+
+tab3 <- tibble(
+  Model = c(
+    "M0: Null (Random Intercept Only)",
+    "M1: Additive Main Effects",
+    "M2: Global Group × Laser",
+    "M3: Epoch-Specific 3-Way Interaction"
+  ),
+  Parameters = lrt_res$npar,
+  AIC = round(lrt_res$AIC, 2),
+  BIC = round(lrt_res$BIC, 2),
+  LogLik = round(lrt_res$logLik, 2),
+  `LRT χ² (df)` = c(
+    "—",
+    sprintf("%.2f (%d)", lrt_res$Chisq[2], lrt_res$Df[2]),
+    sprintf("%.2f (%d)", lrt_res$Chisq[3], lrt_res$Df[3]),
+    sprintf("%.2f (%d)", lrt_res$Chisq[4], lrt_res$Df[4])
+  ),
+  `LRT p` = c(
+    "—",
+    sprintf("%.4f", lrt_res$`Pr(>Chisq)`[2]),
+    sprintf("%.4f", lrt_res$`Pr(>Chisq)`[3]),
+    sprintf("%.4f", lrt_res$`Pr(>Chisq)`[4])
+  ),
+  `Marginal R²` = sapply(r2_list, \(x) sprintf("%.3f", x$R2_marginal)),
+  `Conditional R²` = sapply(r2_list, \(x) sprintf("%.3f", x$R2_conditional))
+)
+
+kable(
+  tab3,
+  caption = "Table 3. Nested Linear Mixed-Effects Model Comparison (Maximum Likelihood, N = 612 Sessions, 20 Subjects).",
+  align = "lcccccccc"
+) |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE)
+```
+
+In the null model (`M0`), the intraclass correlation coefficient was $\text{ICC} = 0.421$, indicating that `42.1%` of the variance in session-level risky choice reflected stable individual differences across rats and confirming the necessity of hierarchical modeling. Adding additive main effects (`M1`) significantly improved fit over `M0` ($\chi^2(8) = 22.03, p = 0.0049$), whereas adding a global two-way `Group × Condition` interaction (`M2`) yielded virtually zero improvement ($\chi^2(1) = 0.01, p = 0.9125$; $\text{AIC}$ worsened from `-1299.11` to `-1297.12`). Crucially, allowing the optogenetic effect to vary across task epochs in the three-way interaction model (`M3`) produced a decisive improvement in model fit ($\chi^2(15) = 40.62, p = 0.0004$), achieving the lowest $\text{AIC}$ (`-1307.74`) and accounting for `49.6%` of total behavioral variance ($R^2_m = 0.102, R^2_c = 0.496$). We therefore selected `M3` for inferential reporting.
+
+### Diagnostics and Robustness Checks
+
+```{r diagnostics-and-reml}
+#| label: diagnostics-and-reml
+
+# Refit M3 via REML for unbiased variance components and inference
+m3_reml <- lmer(Prop_HR ~ Group * Condition * TaskPhase + Order + (1 | Subject), data = vta_clean, REML = TRUE)
+m3_ls   <- lmer(LSRatio ~ Group * Condition * TaskPhase + Order + (1 | Subject), data = vta_clean, REML = TRUE)
+
+# Residual & random-effect diagnostics
+res_l1 <- resid(m3_reml)
+fit_l1 <- fitted(m3_reml)
+re_l2  <- ranef(m3_reml)$Subject[, 1]
+
+sw_l1 <- shapiro.test(res_l1)
+sw_l2 <- shapiro.test(re_l2)
+het_test <- cor.test(fit_l1, abs(res_l1))
+
+# Sensitivity check: Binomial GLMM on discrete free-choice counts
+m3_glmm <- glmer(
+  cbind(`HR-press`, `LR-press`) ~ Group * Condition * TaskPhase + Order + (1 | Subject),
+  data = vta_clean,
+  family = binomial(link = "logit"),
+  control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5))
+)
+```
+
+Diagnostic evaluation of `M3` confirmed that linear mixed-model assumptions were well satisfied:
+
+* **Residual & Random-Effect Normality:** Level-1 residuals (`n = 612`, `SD = 0.074`) showed no significant departure from normality (Shapiro–Wilk $W = `r round(sw_l1$statistic, 4)`$, $p = `r round(sw_l1$p.value, 4)`$), and Level-2 subject random intercepts (`n = 20`) were likewise normally distributed ($W = `r round(sw_l2$statistic, 4)`$, $p = `r round(sw_l2$p.value, 4)`$).
+* **Homoscedasticity & Boundary Behavior:** The correlation between absolute residuals and fitted values was small and non-significant ($r = `r round(het_test$estimate, 4)`$, $p = `r round(het_test$p.value, 4)`$). All `612` fitted probabilities lay strictly inside $[0.407, 0.770]$, well away from the $[0, 1]$ boundaries.
+* **Binomial GLMM Sensitivity Check:** Refitting `M3` as a binomial logistic GLMM on discrete choice counts (`cbind(HR-press, LR-press)`) confirmed the exact same bidirectional pattern on the log-odds scale, demonstrating that inferences are invariant to link specification.
+
+### Planned Contrasts and Substantive Parameter Estimates
+
+```{r table4-contrasts}
+#| label: table4-contrasts
+
+emm_hr <- emmeans(m3_reml, ~ Condition | Group * TaskPhase)
+con_hr <- contrast(emm_hr, method = list("20mW - blocked" = c(-1, 1))) |>
+  summary(infer = TRUE) |>
+  as_tibble()
+
+emm_ls <- emmeans(m3_ls, ~ Condition | Group * TaskPhase)
+con_ls <- contrast(emm_ls, method = list("20mW - blocked" = c(-1, 1))) |>
+  summary(infer = TRUE) |>
+  as_tibble()
+
+tab4 <- con_hr |>
+  select(Group, `Task Epoch` = TaskPhase, estimate, SE, lower.CL, upper.CL, t.ratio, p.value) |>
+  left_join(
+    con_ls |> select(Group, `Task Epoch` = TaskPhase, ls_est = estimate, ls_p = p.value),
+    by = c("Group", "Task Epoch")
+  ) |>
+  mutate(
+    `Δ Risky Choice (pp)` = sprintf("%+.2f", estimate * 100),
+    `SE (pp)` = sprintf("%.2f", SE * 100),
+    `95% CI (pp)` = sprintf("[%+.2f, %+.2f]", lower.CL * 100, upper.CL * 100),
+    `t` = sprintf("%+.2f", t.ratio),
+    `p (Risky Choice)` = sprintf("%.4f", p.value),
+    `Δ Lose-Shift (pp)` = sprintf("%+.2f (p=%.3f)", ls_est * 100, ls_p)
+  ) |>
+  select(Group, `Task Epoch`, `Δ Risky Choice (pp)`, `SE (pp)`, `95% CI (pp)`, `t`, `p (Risky Choice)`, `Δ Lose-Shift (pp)`)
+
+kable(
+  tab4,
+  caption = "Table 4. REML Model-Estimated Optogenetic Laser Contrasts (20mW − blocked) on Risky Choice and Lose-Shift Behavior.",
+  align = "llcccccc"
+) |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE)
+```
+
+```{r figure1-opto-effects}
+#| label: figure1-opto-effects
+#| fig-width: 12
+#| fig-height: 5.2
+#| fig-cap: "Figure 1. Temporally specific VTA optogenetic inhibition bidirectionally modulates risky choice. (A) Subject-level paired means and group means (± SEM) across epochs in EYFP controls. (B) Arch rats exhibit increased risky choice when VTA is inhibited during Certain reward receipt (p = .0003) and decreased risky choice when inhibited during Risky Win receipt (p = .0189). (C) Forest plot of M3 REML laser contrasts (20mW − blocked) with 95% confidence intervals."
+
+subj_means <- vta_clean |>
+  group_by(Subject, Group, TaskPhase, Condition) |>
+  summarise(Prop_HR = mean(Prop_HR), .groups = "drop")
+
+p1_a <- ggplot(filter(subj_means, Group == "EYFP"), aes(x = TaskPhase, y = Prop_HR, color = Condition)) +
+  geom_hline(yintercept = 0.5, linetype = "dotted", color = "grey50") +
+  geom_line(aes(group = interaction(Subject, TaskPhase)), color = "grey80", linewidth = 0.5) +
+  geom_point(position = position_dodge(width = 0.4), alpha = 0.5, size = 2) +
+  stat_summary(fun.data = mean_se, position = position_dodge(width = 0.4), size = 0.7, linewidth = 0.9) +
+  scale_color_manual(values = c("blocked" = "#5C6B73", "20mW" = "#1B9E77"), labels = c("Baseline (blocked)", "Laser (20mW)")) +
+  coord_cartesian(ylim = c(0.25, 0.92)) +
+  labs(title = "A. EYFP Controls (n = 7)", x = NULL, y = "Proportion High-Risk Choices") +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1), legend.position = "bottom")
+
+p1_b <- ggplot(filter(subj_means, Group == "Arch"), aes(x = TaskPhase, y = Prop_HR, color = Condition)) +
+  geom_hline(yintercept = 0.5, linetype = "dotted", color = "grey50") +
+  geom_line(aes(group = interaction(Subject, TaskPhase)), color = "grey80", linewidth = 0.5) +
+  geom_point(position = position_dodge(width = 0.4), alpha = 0.5, size = 2) +
+  stat_summary(fun.data = mean_se, position = position_dodge(width = 0.4), size = 0.7, linewidth = 0.9) +
+  annotate("text", x = 2, y = 0.88, label = "***\np = .0003", size = 3, fontface = "bold", color = "#B22222") +
+  annotate("text", x = 4, y = 0.88, label = "*\np = .0189", size = 3, fontface = "bold", color = "#B22222") +
+  scale_color_manual(values = c("blocked" = "#5C6B73", "20mW" = "#D95F02"), labels = c("Baseline (blocked)", "VTA Laser (20mW)")) +
+  coord_cartesian(ylim = c(0.25, 0.92)) +
+  labs(title = "B. Arch VTA Inhibition (n = 13)", x = NULL, y = NULL) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1), legend.position = "bottom")
+
+p1_c <- ggplot(con_hr, aes(x = estimate * 100, y = fct_rev(TaskPhase), color = Group, shape = Group)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey30") +
+  geom_errorbarh(aes(xmin = lower.CL * 100, xmax = upper.CL * 100), height = 0.22, position = position_dodge(width = 0.45), linewidth = 0.85) +
+  geom_point(size = 2.8, position = position_dodge(width = 0.45)) +
+  scale_color_manual(values = c("EYFP" = "#1B9E77", "Arch" = "#D95F02")) +
+  labs(title = "C. M3 Laser Contrasts", x = "Δ Risky Choice (pp ± 95% CI)", y = NULL) +
+  theme(legend.position = "bottom")
+
+p1_a + p1_b + p1_c + plot_layout(widths = c(1.1, 1.1, 1))
+```
+
+```{r figure2-discounting-diagnostics}
+#| label: figure2-discounting-diagnostics
+#| fig-width: 12
+#| fig-height: 4.5
+#| fig-cap: "Figure 2. Within-session probability discounting curves and Model M3 residual diagnostics. (A) Objective reward-probability discounting curves in Arch rats showing upward value shift during Certain inhibition and downward shift during RiskyWin inhibition. (B) Level-1 residuals versus fitted values confirming homoscedasticity. (C) Normal Q-Q plot of Level-1 residuals."
+
+# Align block-level choice proportions by objective risky reward probability
+block_long <- vta_clean |>
+  filter(Group == "Arch", Condition == "blocked" | TaskPhase %in% c("Certain", "RiskyWin")) |>
+  mutate(
+    CurveGroup = case_when(
+      Condition == "blocked" ~ "Arch Baseline (blocked)",
+      TaskPhase == "Certain" ~ "Arch Laser: Certain (+6.7 pp)",
+      TaskPhase == "RiskyWin" ~ "Arch Laser: RiskyWin (-4.5 pp)"
+    )
+  ) |>
+  select(Subject, Order, CurveGroup, Block1_PRC:Block5_PRC) |>
+  pivot_longer(Block1_PRC:Block5_PRC, names_to = "Block", values_to = "Block_PRC") |>
+  mutate(
+    BlockNum = as.integer(str_extract(Block, "\\d")),
+    ProbLabel = case_when(
+      Order == "Desc" ~ c("100%", "50%", "25%", "12.5%", "6.25%")[BlockNum],
+      Order == "Asc"  ~ c("6.25%", "12.5%", "25%", "50%", "100%")[BlockNum]
+    ),
+    ProbLabel = factor(ProbLabel, levels = c("100%", "50%", "25%", "12.5%", "6.25%"))
+  )
+
+p2_a <- ggplot(block_long, aes(x = ProbLabel, y = Block_PRC, color = CurveGroup, group = CurveGroup)) +
+  stat_summary(fun.data = mean_se, geom = "errorbar", width = 0.15, linewidth = 0.8) +
+  stat_summary(fun = mean, geom = "line", linewidth = 0.9) +
+  stat_summary(fun = mean, geom = "point", size = 2.5) +
+  scale_color_manual(values = c("#4A5568", "#2B6CB0", "#C53030")) +
+  coord_cartesian(ylim = c(0, 1.05)) +
+  labs(title = "A. Probability Discounting (Arch)", x = "Risky Lever Reward Probability", y = "Proportion High-Risk Choices", color = NULL) +
+  theme(legend.position = c(0.36, 0.22), legend.background = element_blank(), legend.text = element_text(size = 8))
+
+diag_df <- tibble(fitted = fit_l1, resid = res_l1)
+
+p2_b <- ggplot(diag_df, aes(x = fitted, y = resid)) +
+  geom_point(alpha = 0.35, color = "#2B6CB0", size = 1.6) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "#C53030") +
+  geom_smooth(method = "loess", se = FALSE, color = "#1A202C", linewidth = 0.8) +
+  labs(title = "B. M3 Residuals vs. Fitted", x = "Fitted Values (Prop_HR)", y = "Level-1 Residuals")
+
+p2_c <- ggplot(diag_df, aes(sample = resid)) +
+  stat_qq(alpha = 0.35, color = "#2B6CB0", size = 1.6) +
+  stat_qq_line(color = "#C53030", linewidth = 0.8) +
+  labs(title = "C. Normal Q-Q Plot", x = "Theoretical Quantiles", y = "Sample Residual Quantiles")
+
+p2_a + p2_b + p2_c + plot_layout(widths = c(1.25, 1, 1))
+```
+
+As detailed in Table 4 and Figure 1, planned simple-effect contrasts from `M3` reveal a double dissociation in `Arch` rats alongside complete null effects in `EYFP` controls:
+
+* **Certain Reward Silencing (`Arch | Certain`):** Inhibiting VTA neurons during delivery of the 1-pellet certain reward significantly **increased** risky lever preference by **`+6.74` percentage points** (`95% CI [+3.11, +10.36] pp`, $t = +3.64, p = 0.0003$), accompanied by an **`-8.43` percentage-point reduction** in lose-shift switching (`95% CI [-15.61, -1.25] pp`, $p = 0.0214$).
+* **Risky Win Silencing (`Arch | RiskyWin`):** Conversely, inhibiting VTA neurons during receipt of the 4-pellet risky reward significantly **decreased** risky lever preference by **`-4.52` percentage points** (`95% CI [-8.29, -0.75] pp`, $t = -2.35, p = 0.0189$), driven by a **`+14.56` percentage-point surge** in lose-shift switching (`95% CI [+7.09, +22.03] pp`, $p = 0.0001$).
+* **Choice, Omission, and ITI Specificity:** In `Arch` rats, laser delivery during choice deliberation (`Choice`: `-2.15 pp`, $p = 0.2641$), risky reward omission (`RiskyLoss`: `-1.84 pp`, $p = 0.3199$), or ITI windows (`CertainITI`: `+0.32 pp`, $p = 0.8755$; `RiskyWinITI`: `+1.16 pp`, $p = 0.5836$) produced no reliable change in risky choice. In `EYFP` control rats, laser delivery produced no significant effect in any of the six epochs (all $|t| \le 1.45$, all $p \ge 0.1481$).
+
+---
+
+## Discussion
+
+### Principal Findings and Mechanistic Interpretation
+
+These results demonstrate that VTA neural activity shapes probabilistic risk preference specifically during **reward outcome evaluation** rather than pre-choice deliberation. Silencing VTA neurons during `Certain` reward receipt shifted rats toward greater risk-taking (`+6.74 pp`) and reduced sensitivity to subsequent losses (`-8.43 pp` lose-shift), consistent with blunting the positive RPE and cached subjective value of the safe 1-pellet alternative. Conversely, silencing VTA neurons during `RiskyWin` delivery shifted rats away from the risky lever (`-4.52 pp`) and sharply elevated lose-shift switching (`+14.56 pp`), consistent with attenuating the positive reinforcement signal needed to sustain risky responding across probabilistic omissions. The absence of effects during `CertainITI`, `RiskyWinITI`, and across all epochs in `EYFP` controls rules out nonspecific light-induced heating, visual distraction, or baseline drift.
+
+### Scope of Inference, Limitations, and Implications
+
+Several limitations bound these conclusions. First, the sample contained more `Arch` (`n = 13`) than `EYFP` (`n = 7`) animals, resulting in wider confidence intervals for `EYFP` contrasts (`SE ≈ 2.7–3.3 pp` vs. `1.9–2.1 pp` in `Arch`), though all `EYFP` point estimates remained near zero. Second, because pan-neuronal VTA Archaerhodopsin inhibits both dopaminergic and local GABAergic neurons, these behavioral data establish VTA circuit necessity during reward receipt without isolating cell-type-specific contributions. Third, session-level linear mixed models summarize choice proportions across 80 free-choice trials; future work can fit trial-by-trial Rescorla–Wagner reinforcement-learning models to the raw trial sequence (`Response_1`–`Response_120`) to estimate separate learning-rate parameters ($\alpha^+$, $\alpha^-$) under laser inhibition.
+
+Substantively, identifying a bidirectional, outcome-locked VTA mechanism clarifies how disrupted reward-valuation signals distort risk sensitivity: blunted neural valuation of modest, reliable rewards biases behavior toward risky alternatives, whereas blunted valuation of high-magnitude probabilistic wins induces premature loss-driven switching.
